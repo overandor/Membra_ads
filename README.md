@@ -1,83 +1,107 @@
 # Membra Ads
 
-Membra Ads is the physical proof media layer of MEMBRA: a verified micro-out-of-home advertising network where everyday owners can monetize cars, windows, shirts, bags, stickers, NFC tags, and other real-world surfaces.
+**Membra Ads is the first commercial wedge of MEMBRA Labs and the MEMBRA Proof Network.**
 
-## One-line thesis
+It turns physical surfaces into verified QR/NFC media inventory with campaign funding, proof review, scan/tap attribution, audit records, and payout eligibility.
 
-Membra turns real-world surfaces into verified ad inventory with QR/NFC attribution, proof photos, campaign funding, vendor-fulfilled media kits, and owner payouts.
+## Company Context
 
-## Product category
+- Company: **MEMBRA Labs**
+- Flagship product: **MEMBRA Proof Network**
+- Commercial wedge: **Membra Ads**
+- Category: verified physical media, proof-backed micro-out-of-home advertising, QR/NFC attribution
 
-- Physical micro-ad network
-- QR/NFC proof media API
-- Owner monetization marketplace
-- Advertiser campaign fulfillment layer
-- ProofBook-backed out-of-home attribution system
+Membra Ads is not a standalone ad network. It is the campaign and proof-control plane for MEMBRA Labs.
 
-## Core participants
+## Core Workflow
 
-- **Owner** — person who owns an ad surface such as a car, window, shirt, bag, or physical location.
-- **Advertiser** — business funding a physical placement campaign.
-- **Campaign** — funded ad offer with creative, destination, budget, placement requirements, and proof rules.
-- **Media Kit** — QR/NFC/print package produced for a campaign placement.
-- **Proof Reviewer** — human or automated reviewer that verifies installation, location, timestamp, and compliance.
-- **Vendor** — Printful, Printify, Gelato, local sign shop, Sticker Mule-style manual workflow, or NFC tag supplier.
-
-## Membra control-plane rule
-
-The frontend, owner app, advertiser dashboard, and admin dashboard call only Membra APIs.
-
-Vendor APIs sit behind Membra as fulfillment rails. Owners and advertisers should never call Printful, Printify, Gelato, Stripe, or NFC vendors directly.
-
-## MVP flow
-
-1. Owner registers a surface.
+1. Owner registers a physical surface or asset.
 2. Advertiser creates a campaign.
-3. Advertiser submits creative.
-4. Admin approves creative.
-5. Advertiser funds campaign.
-6. Owner accepts campaign.
-7. Membra generates QR tracking URL and optional NFC ID.
-8. Membra creates a media kit.
-9. Membra orders the kit or exports vendor-ready files.
-10. Owner confirms receipt.
-11. Owner uploads proof photo and location.
-12. Membra reviews proof.
-13. QR/NFC scans are tracked through Membra redirect URLs.
-14. Stripe Connect payout is released when proof rules pass.
+3. Advertiser submits destination and budget.
+4. MEMBRA generates QR/NFC media kit identifiers.
+5. Owner receives or installs the media kit.
+6. Owner submits proof photo and optional location data.
+7. Admin or automated review approves, rejects, or disputes proof.
+8. QR/NFC scans route through MEMBRA-controlled tracking URLs.
+9. Payout eligibility is calculated only after proof rules pass.
+10. Reports flow into MEMBRA KPI and ProofBook.
 
-## Payout law
+## Current Repository Contents
 
-No approved creative -> no kit generated.
+- `app.py` — FastAPI scaffold for owners, advertisers, assets, campaigns, media kits, proof events, QR redirects, NFC tracking, and audit events.
+- `schema.sql` — database schema scaffold, where present.
+- `.env.example` — environment configuration scaffold, where present.
+- `docs/` — product, proof, pricing, API, and vendor strategy documentation, where present.
 
-No Membra QR/NFC ID -> no certified placement.
+## API Scope
 
-No shipped kit -> no activation.
+This repo owns the first product backend for:
 
-No proof photo + timestamp + location match -> no payout eligibility.
+- owner creation
+- advertiser creation
+- ad asset registration
+- asset verification
+- campaign creation
+- campaign funded status
+- media kit generation
+- QR/NFC ID generation
+- proof submission
+- proof review
+- redirect tracking
+- audit event generation
 
-No Membra redirect URL -> no scan attribution.
+## Safety and Commercial Rules
 
-No approved proof -> no payout release.
+- No approved creative → no certified kit.
+- No MEMBRA QR/NFC ID → no certified placement.
+- No proof photo/timestamp/location check → no payout eligibility.
+- No MEMBRA redirect URL → no scan attribution.
+- No approved proof → no payout release.
+- No guaranteed advertiser performance.
+- No guaranteed owner income.
 
-## Repository contents
+## Relationship to Other Repos
 
-- `app.py` — FastAPI starter control plane.
-- `schema.sql` — Postgres/Supabase-ready schema.
-- `.env.example` — configuration scaffold.
-- `docs/api-map.md` — canonical endpoint map.
-- `docs/vendor-strategy.md` — Printful/Printify/Gelato/NFC/manual vendor strategy.
-- `docs/proof-policy.md` — proof, fraud, review, and payout rules.
-- `docs/pricing.md` — starting campaign and payout model.
+| Repo | Relationship |
+|---|---|
+| `overandor/membra` | company hub, demo runtime, doctrine, appraisal, KPI generator |
+| `overandor/membra-qr-gateway` | buyer-visible dashboard and QR/provenance UI |
+| `overandor/Membra_kpi` | reports for campaigns, owners, advertisers, proof, scans, and payouts |
+| `overandor/Membra_proofbook` | future proof ledger for hashes, audit records, and eligibility states |
+| `overandor/Membra_vendor_adapters` | future vendor rails for print, stickers, NFC, and fulfillment |
+| `overandor/Membra_admin-` | future operator console for creative approval, proof review, fraud, claims, payouts |
+| `overandor/Membra_wallet` | optional non-custodial payout and wallet relay boundary |
 
-## Safety and compliance posture
+## Local Development
 
-This repository does not execute payments by itself. Payment capture and payout release must be implemented through Stripe Connect or another regulated payment rail.
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install fastapi uvicorn pydantic
+uvicorn app:app --reload
+```
 
-This repository does not imply guaranteed owner income or guaranteed advertiser performance.
+Health check:
 
-All physical placements require advertiser approval, owner consent, proof review, and audit logging.
+```text
+GET /v1/health
+```
 
-## Current stage
+## Productization Priority
 
-Productized seed repo. Backend scaffold and documentation are ready for MVP implementation.
+This repo should become the first production backend for MEMBRA Labs.
+
+Next build steps:
+
+1. add proper auth
+2. move SQLite to Postgres/Supabase
+3. add API docs and tests
+4. connect seeded demo data
+5. connect dashboard panels from `membra-qr-gateway`
+6. add proof-photo upload storage
+7. add payout hold/release state machine
+8. expose KPI/reporting hooks
+
+## Status
+
+Prototype backend scaffold. Suitable for demo consolidation, not yet production deployment without auth, persistence hardening, tests, and compliance review.
