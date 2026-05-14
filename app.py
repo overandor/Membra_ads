@@ -1,249 +1,209 @@
+"""MEMBRA Ads — physical proof media control plane for Hugging Face/FastAPI.
+
+Production posture:
+- deterministic campaign/media-kit packaging from user input
+- Stripe checkout and signed webhook endpoint
+- no private keys, no payout guarantees, no fabricated campaign metrics
+"""
 from __future__ import annotations
 
+import csv
 import datetime as dt
+import json
 import os
 import sqlite3
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import RedirectResponse
+import gradio as gr
+import stripe
+import uvicorn
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-APP_NAME = os.getenv('APP_NAME', 'Membra Ads API')
-APP_VERSION = '0.1.0'
-DB_PATH = Path(os.getenv('APP_DB_PATH', 'membra_ads.db'))
-QR_BASE_URL = os.getenv('QR_BASE_URL', 'http://localhost:8000/r')
-NFC_BASE_URL = os.getenv('NFC_BASE_URL', 'http://localhost:8000/n')
-PROOF_REVIEW_REQUIRED = os.getenv('PROOF_REVIEW_REQUIRED', 'true').lower() == 'true'
+APP_NAME = "MEMBRA Ads"
+DB_PATH = Path(os.getenv("DB_PATH", "/tmp/membra_ads.sqlite3"))
+APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:7860").rstrip("/")
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "")
+stripe.api_key = STRIPE_SECRET_KEY or None
+api = FastAPI(title=APP_NAME)
 
-app = FastAPI(title=APP_NAME, version=APP_VERSION)
+class CampaignIn(BaseModel):
+    advertiser_email: str
+    advertiser_name: str
+    campaign_name: str
+    destination_url: str
+    budget_usd: float = Field(ge=0)
+    surface_type: str
+    geography: str
+    proof_requirements: str = "photo, timestamp, location confirmation, visible QR/NFC marker"
+    creative_notes: str = ""
+
+class CheckoutIn(BaseModel):
+    email: str
+    campaign_id: str | None = None
 
 
-def now_iso() -> str:
+def now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
-def new_id(prefix: str) -> str:
-    return f'{prefix}_{uuid.uuid4().hex[:16]}'
-
-
 def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db() -> None:
     with db() as conn:
-        conn.executescript('''
-        CREATE TABLE IF NOT EXISTS owners (
-          id TEXT PRIMARY KEY, email TEXT, display_name TEXT, status TEXT, created_at TEXT, updated_at TEXT
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS campaigns(
+          campaign_id TEXT PRIMARY KEY,
+          advertiser_email TEXT,
+          advertiser_name TEXT,
+          campaign_name TEXT,
+          destination_url TEXT,
+          budget_usd REAL,
+          surface_type TEXT,
+          geography TEXT,
+          proof_requirements TEXT,
+          creative_notes TEXT,
+          status TEXT,
+          stripe_session_id TEXT,
+          created_at TEXT
         );
-        CREATE TABLE IF NOT EXISTS advertisers (
-          id TEXT PRIMARY KEY, email TEXT, company_name TEXT, status TEXT, created_at TEXT, updated_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS ad_assets (
-          id TEXT PRIMARY KEY, owner_id TEXT, asset_type TEXT, title TEXT, city TEXT,
-          status TEXT, verification_status TEXT, created_at TEXT, updated_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS campaigns (
-          id TEXT PRIMARY KEY, advertiser_id TEXT, title TEXT, destination_url TEXT,
-          budget_cents INTEGER, status TEXT, created_at TEXT, updated_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS media_kits (
-          id TEXT PRIMARY KEY, campaign_id TEXT, asset_id TEXT, kit_type TEXT, qr_id TEXT, nfc_id TEXT,
-          vendor TEXT, vendor_order_id TEXT, status TEXT, created_at TEXT, updated_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS proof_events (
-          id TEXT PRIMARY KEY, campaign_id TEXT, owner_id TEXT, asset_id TEXT, media_kit_id TEXT,
-          proof_type TEXT, evidence_url TEXT, latitude REAL, longitude REAL, status TEXT,
-          review_notes TEXT, created_at TEXT, updated_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS tracking_events (
-          id TEXT PRIMARY KEY, campaign_id TEXT, qr_id TEXT, nfc_id TEXT, event_type TEXT, created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS audit_events (
-          id TEXT PRIMARY KEY, actor_id TEXT, event_type TEXT, metadata_json TEXT, created_at TEXT
-        );
-        ''')
+        CREATE TABLE IF NOT EXISTS events(event_id TEXT PRIMARY KEY, campaign_id TEXT, event_type TEXT, payload_json TEXT, created_at TEXT);
+        """)
+
+init_db()
 
 
-@app.on_event('startup')
-def startup() -> None:
-    init_db()
-
-
-class OwnerCreate(BaseModel):
-    email: Optional[str] = None
-    display_name: str = 'Membra Owner'
-
-
-class AdvertiserCreate(BaseModel):
-    email: Optional[str] = None
-    company_name: str = 'Membra Advertiser'
-
-
-class AssetCreate(BaseModel):
-    owner_id: str
-    asset_type: str = Field(..., description='vehicle, window, wearable, bag, sign')
-    title: str
-    city: Optional[str] = None
-
-
-class CampaignCreate(BaseModel):
-    advertiser_id: str
-    title: str
-    destination_url: str
-    budget_cents: int = 0
-
-
-class MediaKitCreate(BaseModel):
-    campaign_id: str
-    asset_id: Optional[str] = None
-    kit_type: str = 'qr_sticker'
-    vendor: Optional[str] = 'manual'
-
-
-class ProofCreate(BaseModel):
-    campaign_id: str
-    owner_id: Optional[str] = None
-    asset_id: Optional[str] = None
-    media_kit_id: Optional[str] = None
-    proof_type: str = 'install_photo'
-    evidence_url: Optional[str] = None
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-
-
-class ReviewProof(BaseModel):
-    status: str = Field(..., description='approved, rejected, disputed')
-    review_notes: Optional[str] = None
-
-
-@app.get('/v1/health')
-def health() -> dict[str, Any]:
-    return {'ok': True, 'app': APP_NAME, 'version': APP_VERSION, 'proof_review_required': PROOF_REVIEW_REQUIRED}
-
-
-@app.post('/v1/owners')
-def create_owner(payload: OwnerCreate) -> dict[str, Any]:
-    oid = new_id('owner')
-    ts = now_iso()
+def build_campaign(data: CampaignIn) -> dict[str, Any]:
+    campaign_id = "cmp_" + uuid.uuid4().hex[:12]
+    qr_url = f"{APP_BASE_URL}/r/{campaign_id}"
+    kit = {
+        "campaign_id": campaign_id,
+        "status": "draft_pending_funding_and_creative_approval",
+        "advertiser": {"name": data.advertiser_name, "email": data.advertiser_email},
+        "campaign": {"name": data.campaign_name, "destination_url": data.destination_url, "budget_usd": data.budget_usd, "geography": data.geography},
+        "placement": {"surface_type": data.surface_type, "qr_redirect_url": qr_url, "nfc_id": "nfc_" + campaign_id[4:]},
+        "proof_policy": {"requirements": data.proof_requirements, "payout_rule": "No approved proof means no payout eligibility."},
+        "creative_notes": data.creative_notes,
+        "created_at": now(),
+    }
     with db() as conn:
-        conn.execute('INSERT INTO owners VALUES (?, ?, ?, ?, ?, ?)', (oid, payload.email, payload.display_name, 'active', ts, ts))
-    return {'owner_id': oid, 'status': 'active'}
+        conn.execute("INSERT INTO campaigns VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (campaign_id, data.advertiser_email, data.advertiser_name, data.campaign_name, data.destination_url, data.budget_usd, data.surface_type, data.geography, data.proof_requirements, data.creative_notes, kit["status"], None, kit["created_at"]))
+    return kit
 
 
-@app.post('/v1/advertisers')
-def create_advertiser(payload: AdvertiserCreate) -> dict[str, Any]:
-    aid = new_id('adv')
-    ts = now_iso()
+def campaign_table() -> list[dict[str, Any]]:
     with db() as conn:
-        conn.execute('INSERT INTO advertisers VALUES (?, ?, ?, ?, ?, ?)', (aid, payload.email, payload.company_name, 'active', ts, ts))
-    return {'advertiser_id': aid, 'status': 'active'}
+        rows = conn.execute("SELECT campaign_id,campaign_name,advertiser_name,budget_usd,surface_type,geography,status,created_at FROM campaigns ORDER BY created_at DESC LIMIT 200").fetchall()
+    return [dict(r) for r in rows]
 
 
-@app.post('/v1/ad-assets')
-def create_asset(payload: AssetCreate) -> dict[str, Any]:
-    asset_id = new_id('asset')
-    ts = now_iso()
+def export_campaigns() -> str:
+    rows = campaign_table()
+    path = "/tmp/membra_ads_campaigns.csv"
+    if rows:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader(); writer.writerows(rows)
+    else:
+        Path(path).write_text("campaign_id,campaign_name,status\n", encoding="utf-8")
+    return path
+
+
+def ui_create(email, advertiser, name, destination, budget, surface, geography, proof, notes):
+    try:
+        data = CampaignIn(advertiser_email=email, advertiser_name=advertiser, campaign_name=name, destination_url=destination, budget_usd=float(budget or 0), surface_type=surface, geography=geography, proof_requirements=proof, creative_notes=notes)
+        kit = build_campaign(data)
+        return json.dumps(kit, indent=2), campaign_table(), export_campaigns()
+    except Exception as exc:
+        return f"Error: {exc}", campaign_table(), None
+
+
+def ui_checkout(email, campaign_id):
+    if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
+        return "Stripe is not configured."
+    session = stripe.checkout.Session.create(mode="payment", customer_email=email, line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}], success_url=f"{APP_BASE_URL}/?checkout=success", cancel_url=f"{APP_BASE_URL}/?checkout=cancelled", metadata={"campaign_id": campaign_id or ""})
+    if campaign_id:
+        with db() as conn:
+            conn.execute("UPDATE campaigns SET stripe_session_id=?, status=? WHERE campaign_id=?", (session.id, "funding_checkout_created", campaign_id))
+    return session.url
+
+@api.get("/api/health")
+def health():
+    return {"ok": True, "app": APP_NAME, "stripe_configured": bool(STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET and STRIPE_PRICE_ID)}
+
+@api.get("/api/campaigns")
+def get_campaigns():
+    return {"campaigns": campaign_table()}
+
+@api.post("/api/campaigns")
+def create_campaign(data: CampaignIn):
+    return build_campaign(data)
+
+@api.post("/api/stripe/create-checkout-session")
+def checkout(data: CheckoutIn):
+    return {"url": ui_checkout(data.email, data.campaign_id or "")}
+
+@api.post("/api/stripe/webhook")
+async def stripe_webhook(request: Request, stripe_signature: str | None = Header(default=None)):
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(500, "STRIPE_WEBHOOK_SECRET is not configured")
+    body = await request.body()
+    try:
+        event = stripe.Webhook.construct_event(body, stripe_signature, STRIPE_WEBHOOK_SECRET)
+    except Exception as exc:
+        raise HTTPException(400, str(exc))
+    obj = event["data"]["object"]
+    campaign_id = obj.get("metadata", {}).get("campaign_id")
+    if campaign_id and event["type"] == "checkout.session.completed":
+        with db() as conn:
+            conn.execute("UPDATE campaigns SET status=? WHERE campaign_id=?", ("funded_pending_creative_approval", campaign_id))
+            conn.execute("INSERT INTO events VALUES(?,?,?,?,?)", ("evt_" + uuid.uuid4().hex[:12], campaign_id, event["type"], json.dumps(obj, default=str), now()))
+    return JSONResponse({"received": True})
+
+@api.get("/r/{campaign_id}")
+def redirect_record(campaign_id: str):
     with db() as conn:
-        conn.execute('INSERT INTO ad_assets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', (asset_id, payload.owner_id, payload.asset_type, payload.title, payload.city, 'pending', 'unverified', ts, ts))
-    return {'asset_id': asset_id, 'status': 'pending', 'verification_status': 'unverified'}
+        row = conn.execute("SELECT destination_url FROM campaigns WHERE campaign_id=?", (campaign_id,)).fetchone()
+        conn.execute("INSERT INTO events VALUES(?,?,?,?,?)", ("evt_" + uuid.uuid4().hex[:12], campaign_id, "scan", "{}", now()))
+    if not row:
+        raise HTTPException(404, "Campaign not found")
+    return PlainTextResponse(f"MEMBRA scan recorded for {campaign_id}. Destination: {row['destination_url']}")
 
+with gr.Blocks(title=APP_NAME) as demo:
+    gr.Markdown("# MEMBRA Ads\nPhysical proof-media campaign control plane. No payout is released without approved proof.")
+    with gr.Row():
+        email = gr.Textbox(label="Advertiser email")
+        advertiser = gr.Textbox(label="Advertiser name")
+    name = gr.Textbox(label="Campaign name")
+    destination = gr.Textbox(label="Destination URL")
+    with gr.Row():
+        budget = gr.Number(label="Budget USD", value=500)
+        surface = gr.Dropdown(["car", "window", "shirt", "bag", "sticker", "NFC tag", "event badge"], label="Surface type", value="sticker")
+        geography = gr.Textbox(label="Target geography", value="local")
+    proof = gr.Textbox(label="Proof requirements", value="photo, timestamp, location confirmation, visible QR/NFC marker")
+    notes = gr.Textbox(label="Creative notes", lines=3)
+    create = gr.Button("Create campaign package", variant="primary")
+    package = gr.Code(label="Campaign package", language="json")
+    table = gr.Dataframe(label="Campaign register", value=campaign_table, interactive=False)
+    export = gr.File(label="CSV export")
+    with gr.Row():
+        checkout_email = gr.Textbox(label="Checkout email")
+        checkout_campaign = gr.Textbox(label="Campaign ID")
+    checkout_btn = gr.Button("Create Stripe checkout")
+    checkout_url = gr.Textbox(label="Checkout URL")
+    create.click(ui_create, [email, advertiser, name, destination, budget, surface, geography, proof, notes], [package, table, export])
+    checkout_btn.click(ui_checkout, [checkout_email, checkout_campaign], [checkout_url])
 
-@app.post('/v1/ad-assets/{asset_id}/verify')
-def verify_asset(asset_id: str) -> dict[str, Any]:
-    with db() as conn:
-        row = conn.execute('SELECT * FROM ad_assets WHERE id=?', (asset_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, 'asset not found')
-        conn.execute('UPDATE ad_assets SET verification_status=?, status=?, updated_at=? WHERE id=?', ('verified', 'available', now_iso(), asset_id))
-    return {'asset_id': asset_id, 'verification_status': 'verified', 'status': 'available'}
+app = gr.mount_gradio_app(api, demo, path="/")
 
-
-@app.post('/v1/campaigns')
-def create_campaign(payload: CampaignCreate) -> dict[str, Any]:
-    campaign_id = new_id('camp')
-    ts = now_iso()
-    with db() as conn:
-        conn.execute('INSERT INTO campaigns VALUES (?, ?, ?, ?, ?, ?, ?, ?)', (campaign_id, payload.advertiser_id, payload.title, payload.destination_url, payload.budget_cents, 'draft', ts, ts))
-    return {'campaign_id': campaign_id, 'status': 'draft'}
-
-
-@app.post('/v1/campaigns/{campaign_id}/fund')
-def fund_campaign(campaign_id: str) -> dict[str, Any]:
-    with db() as conn:
-        row = conn.execute('SELECT * FROM campaigns WHERE id=?', (campaign_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, 'campaign not found')
-        conn.execute('UPDATE campaigns SET status=?, updated_at=? WHERE id=?', ('funded', now_iso(), campaign_id))
-    return {'campaign_id': campaign_id, 'status': 'funded'}
-
-
-@app.post('/v1/media-kits')
-def create_media_kit(payload: MediaKitCreate) -> dict[str, Any]:
-    kit_id = new_id('kit')
-    qr_id = new_id('qr')
-    nfc_id = new_id('nfc') if 'nfc' in payload.kit_type.lower() else None
-    ts = now_iso()
-    with db() as conn:
-        conn.execute('INSERT INTO media_kits VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (kit_id, payload.campaign_id, payload.asset_id, payload.kit_type, qr_id, nfc_id, payload.vendor, None, 'qr_generated', ts, ts))
-    return {'media_kit_id': kit_id, 'qr_id': qr_id, 'nfc_id': nfc_id, 'qr_url': f'{QR_BASE_URL}/{qr_id}'}
-
-
-@app.post('/v1/proof/photo')
-def submit_proof(payload: ProofCreate) -> dict[str, Any]:
-    proof_id = new_id('proof')
-    status = 'submitted' if PROOF_REVIEW_REQUIRED else 'approved'
-    ts = now_iso()
-    with db() as conn:
-        conn.execute('INSERT INTO proof_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (proof_id, payload.campaign_id, payload.owner_id, payload.asset_id, payload.media_kit_id, payload.proof_type, payload.evidence_url, payload.latitude, payload.longitude, status, None, ts, ts))
-    return {'proof_id': proof_id, 'status': status}
-
-
-@app.post('/v1/proof/{proof_id}/review')
-def review_proof(proof_id: str, payload: ReviewProof) -> dict[str, Any]:
-    if payload.status not in {'approved', 'rejected', 'disputed'}:
-        raise HTTPException(400, 'invalid review status')
-    with db() as conn:
-        row = conn.execute('SELECT * FROM proof_events WHERE id=?', (proof_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, 'proof not found')
-        conn.execute('UPDATE proof_events SET status=?, review_notes=?, updated_at=? WHERE id=?', (payload.status, payload.review_notes, now_iso(), proof_id))
-    return {'proof_id': proof_id, 'status': payload.status}
-
-
-@app.get('/r/{qr_id}')
-def qr_redirect(qr_id: str, request: Request) -> RedirectResponse:
-    with db() as conn:
-        kit = conn.execute('SELECT * FROM media_kits WHERE qr_id=?', (qr_id,)).fetchone()
-        if not kit:
-            raise HTTPException(404, 'QR not found')
-        camp = conn.execute('SELECT * FROM campaigns WHERE id=?', (kit['campaign_id'],)).fetchone()
-        if not camp:
-            raise HTTPException(404, 'campaign not found')
-        conn.execute('INSERT INTO tracking_events VALUES (?, ?, ?, ?, ?, ?)', (new_id('track'), camp['id'], qr_id, None, 'qr_scan', now_iso()))
-    return RedirectResponse(camp['destination_url'])
-
-
-@app.get('/v1/campaigns')
-def list_campaigns() -> dict[str, Any]:
-    with db() as conn:
-        rows = conn.execute('SELECT * FROM campaigns ORDER BY created_at DESC LIMIT 100').fetchall()
-    return {'campaigns': [dict(r) for r in rows]}
-
-
-@app.get('/v1/proof-reports/{campaign_id}')
-def proof_report(campaign_id: str) -> dict[str, Any]:
-    with db() as conn:
-        proofs = conn.execute('SELECT * FROM proof_events WHERE campaign_id=? ORDER BY created_at DESC', (campaign_id,)).fetchall()
-        scans = conn.execute('SELECT * FROM tracking_events WHERE campaign_id=? ORDER BY created_at DESC', (campaign_id,)).fetchall()
-    return {'campaign_id': campaign_id, 'proof_events': [dict(r) for r in proofs], 'tracking_events': [dict(r) for r in scans]}
-
-
-if __name__ == '__main__':
-    import uvicorn
-    uvicorn.run(app, host='0.0.0.0', port=int(os.getenv('PORT', '8000')))
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "7860")))
